@@ -1,3 +1,6 @@
+>本專部分程式碼與文件由 AI 產生，我負責整體架構、除錯、測試與強化。
+
+
 # Bing Search Agent
 
 Local Bing search service that fetches search results via Playwright and summarizes answers using local LLM. Supports both MCP Server and HTTP API access methods.
