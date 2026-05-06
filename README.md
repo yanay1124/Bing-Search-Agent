@@ -1,5 +1,90 @@
 # Bing Search Agent
 
+Local Bing search service that fetches search results via Playwright and summarizes answers using local LLM. Supports both MCP Server and HTTP API access methods.
+
+## Requirements
+
+- Python 3.10+
+- Microsoft Edge or Google Chrome
+- Local LLM service (LM Studio, Ollama, etc., compatible with OpenAI API format)
+
+## Installation
+
+```bash
+pip install fastapi uvicorn playwright beautifulsoup4 openai python-dotenv pydantic "mcp==1.6.0" "starlette>=0.40.0,<0.48.0"
+playwright install
+```
+
+> mcp >= 1.7 will conflict with fastapi's starlette version, please use mcp==1.6.0.
+
+## Configuration
+
+Copy `.env.example` to `.env` and fill in the settings:
+
+```env
+LLM_BASE_URL=http://localhost:1234/v1
+LLM_API_KEY=lm-studio
+LLM_MODEL=your-model-name
+
+BROWSER_CHANNEL=msedge   # msedge or chrome
+HEADLESS=false
+
+HOST=127.0.0.1
+PORT=61500
+```
+
+## Starting
+
+**MCP Mode** (Claude Desktop, Cursor, Windsurf)
+
+```bash
+python main.py mcp
+```
+
+Add to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "bing-search": {
+      "command": "python",
+      "args": ["C:/path/to/main.py", "mcp"]
+    }
+  }
+}
+```
+
+**HTTP Mode** (LangChain, AutoGen, OpenClaw)
+
+```bash
+python main.py http
+```
+
+After starting:
+- API Docs: `http://127.0.0.1:61500/docs`
+- Tool Manifest: `http://127.0.0.1:61500/.well-known/ai-plugin.json`
+
+## API
+
+`POST /search` — Search and summarize
+
+```json
+{ "query": "Taiwan AI startups", "max_results": 5 }
+```
+
+`POST /fetch` — Fetch specific page content
+
+```json
+{ "url": "https://example.com/article" }
+```
+
+## License
+
+Apache-2.0
+
+
+# Bing Search Agent
+
 本地 Bing 搜尋服務，透過 Playwright 抓取搜尋結果並以本地 LLM 摘要回答問題。支援 MCP Server 與 HTTP API 兩種接入方式。
 
 ## 需求
