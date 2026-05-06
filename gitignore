@@ -1,16 +1,1 @@
-# 環境變數（絕對不可上傳）
 .env
-
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.venv/
-venv/
-env/
-
-# Playwright 瀏覽器快取
-playwright-browsers/
-
-# 日誌
-*.log
