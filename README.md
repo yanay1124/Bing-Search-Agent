@@ -24,7 +24,7 @@ playwright install
 ```env
 LLM_BASE_URL=http://localhost:1234/v1
 LLM_API_KEY=lm-studio
-LLM_MODEL=microsoft/phi-4-mini-reasoning
+LLM_MODEL=qwen3.6-35b-a3b-uncensored-wasserstein
 
 BROWSER_CHANNEL=msedge   # msedge 或 chrome
 HEADLESS=false
