@@ -37,8 +37,8 @@ USER_AGENT     = os.getenv(
 _playwright = None
 _browser: Browser = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+
+async def start_browser():
     global _playwright, _browser
     _playwright = await async_playwright().start()
     _browser = await _playwright.chromium.launch(
@@ -53,23 +53,17 @@ async def lifespan(app: FastAPI):
         ],
     )
     logger.info(f"瀏覽器已啟動（{'無頭' if HEADLESS else '真視窗（螢幕外）'}模式，channel={BROWSER_CHANNEL}）")
-    yield
-    await _browser.close()
-    await _playwright.stop()
 
 
-app = FastAPI(title="本地搜尋 API", lifespan=lifespan)
+async def stop_browser():
+    global _browser, _playwright
+    if _browser:
+        await _browser.close()
+    if _playwright:
+        await _playwright.stop()
 
-client = AsyncOpenAI(
-    base_url=LLM_BASE_URL,
-    api_key=LLM_API_KEY,
-)
 
-
-class SearchRequest(BaseModel):
-    query: str
-    max_results: int = 5
-
+# ── 共用工具函式 ────────────────────────────────────
 
 def clean_html(html: str, max_chars: int = 13000) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -93,7 +87,6 @@ def decode_bing_url(href: str) -> str:
             u = params.get("u", [None])[0]
             if u and u.startswith("a1"):
                 encoded = u[2:]
-                # 修正：使用更穩健的 padding 計算
                 encoded += "=" * (-len(encoded) % 4)
                 decoded_bytes = base64.urlsafe_b64decode(encoded)
                 decoded = decoded_bytes.decode("utf-8")
@@ -107,7 +100,6 @@ def decode_bing_url(href: str) -> str:
     if href.startswith("a1"):
         try:
             encoded = href[2:]
-            # 修正：使用更穩健的 padding 計算
             encoded += "=" * (-len(encoded) % 4)
             decoded_bytes = base64.urlsafe_b64decode(encoded)
             decoded = decoded_bytes.decode("utf-8")
@@ -126,27 +118,20 @@ async def fetch_page(url: str) -> dict | None:
     try:
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-
-        # 修正：用 wait_for_load_state 取代硬等 sleep，更精確且更快
         try:
             await page.wait_for_load_state("networkidle", timeout=8000)
         except Exception:
-            pass  # networkidle timeout 不算失敗，繼續執行
-
+            pass
         await page.evaluate("window.scrollBy(0, 1200)")
-
         try:
             await page.wait_for_load_state("networkidle", timeout=4000)
         except Exception:
             pass
-
         html = await page.content()
         text = clean_html(html)
-
         if len(text) < 600:
             logger.info(f"內容太少跳過: {url[:60]}")
             return None
-
         logger.info(f"✅ 成功抓取: {url[:80]} ({len(text)} 字)")
         return {"url": url, "content": text}
     except Exception as e:
@@ -170,7 +155,6 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
 
         links = []
 
-        # ── 方法一：用 JS 直接取 a.href（瀏覽器已解析好的完整 URL）──
         js_links: list[str] = await page.evaluate("""
             () => {
                 const selectors = ['li.b_algo h2 a', 'li.b_algo .b_title a', 'li.b_algo a'];
@@ -191,7 +175,6 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
         logger.info(f"JS 直接取得 {len(js_links)} 個連結")
         links.extend(js_links)
 
-        # ── 方法二：若 JS 取得不足，改用 getAttribute + 手動解碼 ──
         if len(links) < candidate_count:
             seen_links = set(links)
             selectors = ["li.b_algo h2 a", "li.b_algo a", "h2 a"]
@@ -202,18 +185,13 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
                     href = await el.get_attribute("href")
                     if not href:
                         continue
-
-                    # 修正：只有確定是 Bing 重定向格式才進解碼，避免正常 URL 被重複處理
                     if "bing.com/ck/a" in href or href.startswith("a1"):
                         href = decode_bing_url(href)
-
                     if not href or not href.startswith("http") or "bing.com" in href:
                         continue
-
                     if href not in seen_links:
                         links.append(href)
                         seen_links.add(href)
-
                     if len(links) >= candidate_count:
                         break
                 if len(links) >= candidate_count:
@@ -230,16 +208,12 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
 
 
 async def search_bing_edge(query: str, max_results: int = 5) -> list[dict]:
-    # 多抓 3 倍候選，確保過濾後仍有足夠結果
     links = await get_bing_links(query, candidate_count=max_results * 3)
     if not links:
         logger.warning("沒有抓到任何連結")
         return []
-
-    # 修正：改為並發抓取，大幅提升速度
     tasks = [fetch_page(url) for url in links]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     contents = []
     for r in results:
         if len(contents) >= max_results:
@@ -248,7 +222,6 @@ async def search_bing_edge(query: str, max_results: int = 5) -> list[dict]:
             contents.append(r)
         elif isinstance(r, Exception):
             logger.warning(f"並發抓取發生例外: {r}")
-
     logger.info(f"最終成功收錄 {len(contents)}/{max_results} 頁")
     return contents
 
@@ -256,11 +229,9 @@ async def search_bing_edge(query: str, max_results: int = 5) -> list[dict]:
 async def summarize(query: str, contents: list[dict]) -> str:
     if not contents:
         return "❌ 這次未能抓到有效內容，請再試一次。"
-
-    # 修正：依實際 contents 數量均分，並設下限避免單頁拿太多
     per_page = min(8000 // max(len(contents), 1), 4000)
     context_text = "\n\n".join([f"來源：{c['url']}\n{c['content'][:per_page]}" for c in contents])
-
+    client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
     try:
         response = await client.chat.completions.create(
             model=LLM_MODEL,
@@ -286,14 +257,35 @@ async def summarize(query: str, contents: list[dict]) -> str:
         return f"❌ LLM 處理失敗: {str(e)}"
 
 
+# ══════════════════════════════════════════════════
+# HTTP 模式（FastAPI）
+# ══════════════════════════════════════════════════
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await start_browser()
+    yield
+    await stop_browser()
+
+
+app = FastAPI(title="本地搜尋 API", lifespan=lifespan)
+
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 5
+
+
+class FetchRequest(BaseModel):
+    url: str
+
+
 @app.post("/search")
 async def search(req: SearchRequest):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query 不可為空")
-
     raw = await search_bing_edge(req.query, req.max_results)
     summary = await summarize(req.query, raw)
-
     return {
         "query": req.query,
         "summary": summary,
@@ -301,6 +293,122 @@ async def search(req: SearchRequest):
     }
 
 
+@app.post("/fetch")
+async def fetch(req: FetchRequest):
+    if not req.url.strip().startswith("http"):
+        raise HTTPException(status_code=400, detail="url 格式不正確")
+    result = await fetch_page(req.url)
+    if result is None:
+        raise HTTPException(status_code=422, detail="無法抓取該頁面，內容太少或載入失敗")
+    return result
+
+
+# ══════════════════════════════════════════════════
+# MCP 模式
+# ══════════════════════════════════════════════════
+
+def run_mcp():
+    from mcp.server import Server
+    from mcp.server.stdio import stdio_server
+    from mcp.types import TextContent, Tool
+
+    mcp_server = Server("bing-search")
+
+    @mcp_server.list_tools()
+    async def list_tools() -> list[Tool]:
+        return [
+            Tool(
+                name="bing_search",
+                description=(
+                    "使用 Bing 搜尋並回傳多個網頁的純文字內容。"
+                    "適合需要最新資訊、新聞、產品規格或任何需要上網查詢的問題。"
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "搜尋關鍵字或問題",
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "description": "最多回傳幾個網頁結果（預設 5，上限 10）",
+                            "default": 5,
+                            "minimum": 1,
+                            "maximum": 10,
+                        },
+                    },
+                    "required": ["query"],
+                },
+            ),
+            Tool(
+                name="fetch_url",
+                description="直接抓取指定 URL 的網頁內容並回傳純文字。",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "要抓取的完整網址（需包含 https://）",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            ),
+        ]
+
+    @mcp_server.call_tool()
+    async def call_tool(name: str, arguments: dict):
+        if name == "bing_search":
+            query = arguments["query"]
+            max_results = min(int(arguments.get("max_results", 5)), 10)
+            contents = await search_bing_edge(query, max_results)
+            if not contents:
+                return [TextContent(type="text", text="❌ 未能抓到有效搜尋結果，請稍後再試。")]
+            per_page = min(8000 // max(len(contents), 1), 4000)
+            parts = [f"### 來源 {i}：{c['url']}\n\n{c['content'][:per_page]}"
+                     for i, c in enumerate(contents, 1)]
+            output = f"搜尋關鍵字：{query}\n找到 {len(contents)} 個結果\n\n" + "\n\n---\n\n".join(parts)
+            return [TextContent(type="text", text=output)]
+
+        elif name == "fetch_url":
+            url = arguments["url"]
+            result = await fetch_page(url)
+            if result is None:
+                return [TextContent(type="text", text=f"❌ 無法抓取 {url}，內容太少或載入失敗。")]
+            return [TextContent(type="text", text=f"來源：{result['url']}\n\n{result['content']}")]
+
+        else:
+            return [TextContent(type="text", text=f"❌ 未知工具：{name}")]
+
+    async def _run():
+        await start_browser()
+        try:
+            async with stdio_server() as (read_stream, write_stream):
+                await mcp_server.run(
+                    read_stream,
+                    write_stream,
+                    mcp_server.create_initialization_options(),
+                )
+        finally:
+            await stop_browser()
+
+    asyncio.run(_run())
+
+
+# ══════════════════════════════════════════════════
+# 入口點
+# ══════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=HOST, port=PORT)
+    mode = sys.argv[1] if len(sys.argv) > 1 else "http"
+
+    if mode == "mcp":
+        run_mcp()
+    elif mode == "http":
+        import uvicorn
+        uvicorn.run(app, host=HOST, port=PORT)
+    else:
+        print(f"未知模式：{mode}")
+        print("用法：python main.py [http|mcp]")
+        sys.exit(1)
