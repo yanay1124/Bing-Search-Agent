@@ -80,4 +80,4 @@ python main.py http
 
 ## License
 
-MIT
+ Apache-2.0 license
