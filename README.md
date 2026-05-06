@@ -81,11 +81,6 @@ After starting:
 { "url": "https://example.com/article" }
 ```
 
-## License
-
-Apache-2.0
-
-
 # 本地 Bing 搜尋服務
 
 本地 Bing 搜尋服務，透過 Playwright 抓取搜尋結果並以本地 LLM 摘要回答問題。支援 MCP Server 與 HTTP API 兩種接入方式。
