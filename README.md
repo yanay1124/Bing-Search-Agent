@@ -76,7 +76,7 @@ python main.py http
 
 ```json
 { "url": "https://example.com/article" }
-```# Bing Search Agent
+# Bing Search Agent
 
 本地 Bing 搜尋服務，透過 Playwright 抓取搜尋結果並以本地 LLM 摘要回答問題。支援 MCP Server 與 HTTP API 兩種接入方式。
 
@@ -88,7 +88,7 @@ python main.py http
 
 ## 安裝
 
-```bash
+bash
 pip install fastapi uvicorn playwright beautifulsoup4 openai python-dotenv pydantic "mcp==1.6.0" "starlette>=0.40.0,<0.48.0"
 playwright install
 ```
