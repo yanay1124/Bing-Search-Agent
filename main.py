@@ -22,6 +22,7 @@ LLM_BASE_URL   = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")
 LLM_API_KEY    = os.getenv("LLM_API_KEY", "lm-studio")
 LLM_MODEL      = os.getenv("LLM_MODEL", "microsoft/phi-4-mini-reasoning")
 BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")   # msedge / chrome
+# 注意：部署到無 display 的 Linux 伺服器時請設定 HEADLESS=true
 HEADLESS       = os.getenv("HEADLESS", "false").lower() == "true"
 HOST           = os.getenv("HOST", "127.0.0.1")
 PORT           = int(os.getenv("PORT", "61500"))
@@ -47,8 +48,8 @@ async def lifespan(app: FastAPI):
             "--no-sandbox",
             "--disable-dev-shm-usage",
             "--disable-blink-features=AutomationControlled",
-            "--window-position=-32000,-32000",   # 移到螢幕外，視覺上等同隱藏
-            "--window-size=1,1",                  # 縮到最小，減少資源佔用
+            "--window-position=-32000,-32000",
+            "--window-size=1,1",
         ],
     )
     logger.info(f"瀏覽器已啟動（{'無頭' if HEADLESS else '真視窗（螢幕外）'}模式，channel={BROWSER_CHANNEL}）")
@@ -80,7 +81,7 @@ def clean_html(html: str, max_chars: int = 13000) -> str:
 
 
 def decode_bing_url(href: str) -> str:
-    """解碼所有 Bing 重定向 URL 格式，失敗回傳空字串。"""
+    """解碼 Bing 重定向 URL，失敗回傳空字串。只處理確定是 Bing 格式的 URL。"""
     if not href:
         return ""
 
@@ -92,9 +93,8 @@ def decode_bing_url(href: str) -> str:
             u = params.get("u", [None])[0]
             if u and u.startswith("a1"):
                 encoded = u[2:]
-                padding = 4 - len(encoded) % 4
-                if padding != 4:
-                    encoded += "=" * padding
+                # 修正：使用更穩健的 padding 計算
+                encoded += "=" * (-len(encoded) % 4)
                 decoded_bytes = base64.urlsafe_b64decode(encoded)
                 decoded = decoded_bytes.decode("utf-8")
                 if decoded.startswith("http"):
@@ -107,9 +107,8 @@ def decode_bing_url(href: str) -> str:
     if href.startswith("a1"):
         try:
             encoded = href[2:]
-            padding = 4 - len(encoded) % 4
-            if padding != 4:
-                encoded += "=" * padding
+            # 修正：使用更穩健的 padding 計算
+            encoded += "=" * (-len(encoded) % 4)
             decoded_bytes = base64.urlsafe_b64decode(encoded)
             decoded = decoded_bytes.decode("utf-8")
             if decoded.startswith("http"):
@@ -118,6 +117,7 @@ def decode_bing_url(href: str) -> str:
             logger.debug(f"decode a1 失敗: {e}")
         return ""
 
+    # 不是 Bing 重定向格式，直接回傳原始 href
     return href
 
 
@@ -126,17 +126,27 @@ async def fetch_page(url: str) -> dict | None:
     try:
         page = await context.new_page()
         await page.goto(url, wait_until="domcontentloaded", timeout=40000)
-        await asyncio.sleep(4)
+
+        # 修正：用 wait_for_load_state 取代硬等 sleep，更精確且更快
+        try:
+            await page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass  # networkidle timeout 不算失敗，繼續執行
+
         await page.evaluate("window.scrollBy(0, 1200)")
-        await asyncio.sleep(2)
-        
+
+        try:
+            await page.wait_for_load_state("networkidle", timeout=4000)
+        except Exception:
+            pass
+
         html = await page.content()
         text = clean_html(html)
-        
+
         if len(text) < 600:
             logger.info(f"內容太少跳過: {url[:60]}")
             return None
-            
+
         logger.info(f"✅ 成功抓取: {url[:80]} ({len(text)} 字)")
         return {"url": url, "content": text}
     except Exception as e:
@@ -152,7 +162,7 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
         page = await context.new_page()
         url = f"https://www.bing.com/search?q={quote_plus(query)}"
         logger.info(f"🔍 Bing 搜尋：{query}")
-        
+
         await page.goto(url, wait_until="networkidle", timeout=60000)
         await asyncio.sleep(6)
         await page.evaluate("window.scrollBy(0, 3000)")
@@ -183,6 +193,7 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
 
         # ── 方法二：若 JS 取得不足，改用 getAttribute + 手動解碼 ──
         if len(links) < candidate_count:
+            seen_links = set(links)
             selectors = ["li.b_algo h2 a", "li.b_algo a", "h2 a"]
             for selector in selectors:
                 elements = await page.locator(selector).all()
@@ -192,14 +203,17 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
                     if not href:
                         continue
 
-                    if "bing.com" in href or href.startswith("a1"):
+                    # 修正：只有確定是 Bing 重定向格式才進解碼，避免正常 URL 被重複處理
+                    if "bing.com/ck/a" in href or href.startswith("a1"):
                         href = decode_bing_url(href)
 
                     if not href or not href.startswith("http") or "bing.com" in href:
                         continue
 
-                    if href not in links:
+                    if href not in seen_links:
                         links.append(href)
+                        seen_links.add(href)
+
                     if len(links) >= candidate_count:
                         break
                 if len(links) >= candidate_count:
@@ -209,7 +223,7 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
         logger.info(f"總共取得 {len(links)} 個有效連結")
         for i, link in enumerate(links[:8]):
             logger.info(f"   {i+1}. {link}")
-            
+
         return links
     finally:
         await context.close()
@@ -222,14 +236,18 @@ async def search_bing_edge(query: str, max_results: int = 5) -> list[dict]:
         logger.warning("沒有抓到任何連結")
         return []
 
-    # 逐一抓取，湊滿 max_results 就停止，避免多餘請求
+    # 修正：改為並發抓取，大幅提升速度
+    tasks = [fetch_page(url) for url in links]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
     contents = []
-    for url in links:
+    for r in results:
         if len(contents) >= max_results:
             break
-        result = await fetch_page(url)
-        if result is not None:
-            contents.append(result)
+        if isinstance(r, dict):
+            contents.append(r)
+        elif isinstance(r, Exception):
+            logger.warning(f"並發抓取發生例外: {r}")
 
     logger.info(f"最終成功收錄 {len(contents)}/{max_results} 頁")
     return contents
@@ -239,7 +257,8 @@ async def summarize(query: str, contents: list[dict]) -> str:
     if not contents:
         return "❌ 這次未能抓到有效內容，請再試一次。"
 
-    per_page = 8000 // max(len(contents), 1)
+    # 修正：依實際 contents 數量均分，並設下限避免單頁拿太多
+    per_page = min(8000 // max(len(contents), 1), 4000)
     context_text = "\n\n".join([f"來源：{c['url']}\n{c['content'][:per_page]}" for c in contents])
 
     try:
@@ -271,7 +290,7 @@ async def summarize(query: str, contents: list[dict]) -> str:
 async def search(req: SearchRequest):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="query 不可為空")
-    
+
     raw = await search_bing_edge(req.query, req.max_results)
     summary = await summarize(req.query, raw)
 
