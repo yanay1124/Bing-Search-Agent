@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import re
-from collections import deque
 from urllib.parse import quote_plus, urlparse, parse_qs
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
@@ -21,44 +20,6 @@ from cache_utils import (
 )
 from settings import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, logger
 
-TRANSPORT_KEYWORDS = [
-    "火車",
-    "高鐵",
-    "台鐵",
-    "捷運",
-    "列車",
-    "時刻表",
-    "班次",
-    "車次",
-    "票",
-    "時刻",
-    "時間",
-]
-
-PRODUCT_KEYWORDS = [
-    "手機",
-    "筆電",
-    "電腦",
-    "相機",
-    "耳機",
-    "價格",
-    "規格",
-    "型號",
-    "評測",
-    "比較",
-]
-
-NEWS_KEYWORDS = [
-    "新聞",
-    "最新",
-    "發布",
-    "更新",
-    "事件",
-    "事故",
-]
-
-GENERAL_SUFFIXES = ["詳細資訊", "官方網站", "說明", "介紹"]
-
 
 def clean_html(html: str, max_chars: int = 13000) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -72,7 +33,6 @@ def clean_html(html: str, max_chars: int = 13000) -> str:
 def decode_bing_url(href: str) -> str:
     if not href:
         return ""
-
     if "bing.com/ck/a" in href:
         try:
             parsed = urlparse(href)
@@ -88,7 +48,6 @@ def decode_bing_url(href: str) -> str:
         except Exception as e:
             logger.debug(f"decode bing ck/a 失敗: {e}")
         return ""
-
     if href.startswith("a1"):
         try:
             encoded = href[2:]
@@ -100,49 +59,7 @@ def decode_bing_url(href: str) -> str:
         except Exception as e:
             logger.debug(f"decode a1 失敗: {e}")
         return ""
-
     return href
-
-
-def is_transport_query(query: str) -> bool:
-    lower_query = query.lower()
-    return any(keyword in lower_query for keyword in TRANSPORT_KEYWORDS)
-
-
-def is_product_query(query: str) -> bool:
-    lower_query = query.lower()
-    return any(keyword in lower_query for keyword in PRODUCT_KEYWORDS)
-
-
-def is_news_query(query: str) -> bool:
-    lower_query = query.lower()
-    return any(keyword in lower_query for keyword in NEWS_KEYWORDS)
-
-
-def build_search_variants(query: str, max_variations: int = 4) -> list[str]:
-    base = query.strip()
-    if not base:
-        return [base]
-
-    variants = [base]
-    if is_transport_query(base) or re.search(r"明天|後天|今天|上午|下午|晚上|\d{1,2}點|\d{1,2}:\d{2}", base):
-        suffixes = ["時刻表", "班次", "票價", "查詢"]
-    elif is_product_query(base):
-        suffixes = ["價格", "規格", "評測", "比較"]
-    elif is_news_query(base):
-        suffixes = ["最新消息", "新聞", "更新", "事件"]
-    else:
-        suffixes = GENERAL_SUFFIXES
-
-    for suffix in suffixes:
-        if len(variants) >= max_variations:
-            break
-        if suffix not in base:
-            candidate = f"{base} {suffix}"
-            if candidate not in variants:
-                variants.append(candidate)
-
-    return variants[:max_variations]
 
 
 async def fetch_page(url: str) -> dict | None:
@@ -237,19 +154,17 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
                 seen_links = set(links)
                 selectors = ["li.b_algo h2 a", "li.b_algo a", "h2 a"]
                 for selector in selectors:
-                    elements = await page.locator(selector).all()
-                    logger.info(f"選擇器 '{selector}' 找到 {len(elements)} 個（備用解碼）")
+                    elements = await page.query_selector_all(selector)
                     for el in elements:
-                        href = await el.get_attribute("href")
-                        if not href:
-                            continue
-                        if "bing.com/ck/a" in href or href.startswith("a1"):
-                            href = decode_bing_url(href)
-                        if not href or not href.startswith("http") or "bing.com" in href:
-                            continue
-                        if href not in seen_links:
-                            links.append(href)
+                        href = await el.get_attribute("href") or ""
+                        href = decode_bing_url(href)
+                        if (
+                            href.startswith("http")
+                            and "bing.com" not in href
+                            and href not in seen_links
+                        ):
                             seen_links.add(href)
+                            links.append(href)
                         if len(links) >= candidate_count:
                             break
                     if len(links) >= candidate_count:
@@ -257,15 +172,20 @@ async def get_bing_links(query: str, candidate_count: int = 10) -> list[str]:
 
             links = links[:candidate_count]
             await _set_cache(LINK_CACHE, LINK_CACHE_LOCK, cache_key, links)
-            logger.info(f"總共取得 {len(links)} 個有效連結")
-            for i, link in enumerate(links[:8]):
-                logger.info(f"   {i+1}. {link}")
+            logger.info(f"共收集 {len(links)} 個連結")
             return links
+        except Exception as e:
+            logger.warning(f"Bing 搜尋失敗：{e}")
+            return []
         finally:
             await context.close()
 
 
 async def infer_subqueries(query: str, subquery_count: int = 3) -> list[str]:
+    """
+    讓 LLM 判斷查詢是否包含多個獨立問題，若是則拆分成獨立子查詢。
+    每個子查詢應可直接送入搜尋引擎。若只有一個問題，回傳原始查詢。
+    """
     cache_key = json.dumps(
         {"query": query, "subquery_count": subquery_count},
         sort_keys=True,
@@ -277,25 +197,34 @@ async def infer_subqueries(query: str, subquery_count: int = 3) -> list[str]:
 
     client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
     prompt = (
-        "你是一個專門把使用者查詢拆成搜尋子查詢的助手。\n"
-        "請判斷下面的查詢是否包含多個問題，並回傳最多 "
-        f"{subquery_count} 個適合直接送到搜尋引擎的子查詢。\n"
-        "這些子查詢應該盡量讓搜尋結果精準找到具體時間、班次、價格、規格或其他數據。\n"
-        "回傳格式請只使用 JSON 陣列，例如 [\"子查詢一\", \"子查詢二\"]。\n"
-        "如果這個查詢只有一個問題，請回傳原始查詢本身。不要生成答案，不要附加說明。\n\n"
+        "你是一個搜尋查詢分析助手。\n"
+        "請判斷下面的查詢是否同時包含多個彼此獨立的問題"
+        "（例如：問了兩件不同的事情、比較兩個不同主題，或同時詢問多個不相關的資訊）。\n\n"
+        "規則：\n"
+        "- 若查詢只有一個核心問題，直接回傳原始查詢（包在 JSON 陣列裡）。\n"
+        f"- 若查詢包含多個獨立問題，請拆分成最多 {subquery_count} 個子查詢，"
+        "每個子查詢需能獨立送入搜尋引擎並取得有效結果。\n"
+        "- 子查詢保留原始語言，不要翻譯或改寫語意。\n"
+        "- 不要憑空新增查詢內容沒提到的資訊。\n\n"
+        "只回傳 JSON 陣列，例如：[\"子查詢一\", \"子查詢二\"]。不要附加任何說明文字。\n\n"
         f"使用者查詢：{query}"
     )
     try:
         response = await client.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "system", "content": prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=256,
         )
         text = response.choices[0].message.content.strip()
         subqueries: list[str] = []
         try:
-            parsed = json.loads(text)
+            # 嘗試擷取 JSON 陣列（處理模型可能在前後加說明文字的情況）
+            match = re.search(r'\[.*?\]', text, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group())
+            else:
+                parsed = json.loads(text)
             if isinstance(parsed, str):
                 parsed = [parsed]
             if isinstance(parsed, list):
@@ -304,7 +233,7 @@ async def infer_subqueries(query: str, subquery_count: int = 3) -> list[str]:
             pass
         if not subqueries:
             lines = [line.strip(" \t\n\r-•.1234567890") for line in text.splitlines() if line.strip()]
-            subqueries = [line for line in lines if len(line) > 10]
+            subqueries = [line for line in lines if len(line) > 5]
         if not subqueries:
             subqueries = [query]
         subqueries = subqueries[:subquery_count]
@@ -316,21 +245,9 @@ async def infer_subqueries(query: str, subquery_count: int = 3) -> list[str]:
 
 
 async def search_single_query(query: str, max_results: int = 5) -> list[dict]:
-    variants = build_search_variants(query, max_variations=4)
-    logger.info(f"🔎 搜尋變體：{variants}")
-
-    seen_links = set()
-    links: list[str] = []
-    for variant in variants:
-        if len(links) >= max_results * 3:
-            break
-        variant_links = await get_bing_links(variant, candidate_count=max_results * 2)
-        for link in variant_links:
-            if link not in seen_links:
-                seen_links.add(link)
-                links.append(link)
-        if len(links) >= max_results * 3:
-            break
+    """直接用單一查詢搜尋，不加任何後綴變體。"""
+    logger.info(f"🔎 搜尋：{query}")
+    links = await get_bing_links(query, candidate_count=max_results * 2)
 
     if not links:
         logger.warning("沒有抓到任何連結")
@@ -406,11 +323,14 @@ async def search_bing_edge(
         return results, [query]
 
     subqueries = await infer_subqueries(query, subquery_count)
+
     if len(subqueries) <= 1:
+        # 單一問題：直接搜尋
         results = await search_single_query(query, max_results)
         await _set_search_cache(query, max_results, skip_llm_split, subquery_count, results, subqueries)
         return results, subqueries
 
+    # 多個獨立問題：依子查詢數量平均分配結果名額
     logger.info(f"LLM 判斷為多子查詢，共 {len(subqueries)} 個：{subqueries}")
     active_subqueries = subqueries[:subquery_count]
     slots = [max_results // len(active_subqueries)] * len(active_subqueries)
@@ -432,6 +352,7 @@ async def search_bing_edge(
         if len(results) >= max_results:
             break
 
+    # 結果不足時用原始查詢補齊
     if len(results) < max_results:
         fallback = await search_single_query(query, max_results)
         for item in fallback:
@@ -470,12 +391,11 @@ async def summarize(query: str, contents: list[dict], subqueries: list[str] | No
                     "role": "system",
                     "content": (
                         "你是一個知識豐富的問答助手。"
-                        "請根據提供的資料回答使用者的問題。"
-                        "如果問題已拆成多個子查詢，請逐一回答每一個子查詢，並標示清楚。"
-                        "若問題是查詢單一參數（如核心數、價格、時間、版本號等），直接給出數值，不需要多餘說明。"
-                        "若問題需要完整介紹，內容要具體，可包含規格、價格、比較、背景資訊等。"
-                        "如果資料中有多個來源說法不同，請說明差異。"
-                        "用繁體中文回答，條理清晰，避免不必要的廢話。"
+                        "請根據提供的搜尋資料，盡可能完整且準確地回答使用者的問題。"
+                        "如果問題包含多個子查詢，請逐一回答每一個，並清楚標示對應哪個子查詢。"
+                        "若資料中有多個來源說法不同，請說明差異。"
+                        "若資料不足以回答，請如實說明，不要捏造資訊。"
+                        "請用與使用者相同的語言回答，條理清晰，避免冗長廢話。"
                     ),
                 },
                 {
@@ -491,12 +411,8 @@ async def summarize(query: str, contents: list[dict], subqueries: list[str] | No
             max_tokens=1400,
         )
         raw_content = response.choices[0].message.content
-        logger.info(
-            f"[LLM] 回傳內容長度：{len(raw_content) if raw_content else 0}"
-        )
-        logger.info(
-            f"[LLM] 回傳前100字：{repr(raw_content[:100]) if raw_content else 'None'}"
-        )
+        logger.info(f"[LLM] 回傳內容長度：{len(raw_content) if raw_content else 0}")
+        logger.info(f"[LLM] 回傳前100字：{repr(raw_content[:100]) if raw_content else 'None'}")
         return raw_content or "❌ LLM 回傳空內容"
     except Exception as e:
         return f"❌ LLM 處理失敗: {str(e)}"
