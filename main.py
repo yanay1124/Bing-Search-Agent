@@ -10,6 +10,7 @@ import base64
 import os
 import sys
 import random
+import re
 import time
 import itertools
 import json
@@ -26,7 +27,8 @@ logger = logging.getLogger(__name__)
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "lm-studio")
 LLM_MODEL = os.getenv("LLM_MODEL", "microsoft/phi-4-mini-reasoning")
-BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")  # msedge / chrome
+
+BROWSER_CHANNEL = os.getenv("BROWSER_CHANNEL", "msedge")
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "61500"))
@@ -36,10 +38,12 @@ USER_AGENT = os.getenv(
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
 )
+
 REQUESTS_PER_MINUTE = int(os.getenv("REQUESTS_PER_MINUTE", "40"))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "3"))
 RANDOM_DELAY_MIN = float(os.getenv("RANDOM_DELAY_MIN", "1.0"))
 RANDOM_DELAY_MAX = float(os.getenv("RANDOM_DELAY_MAX", "3.0"))
+
 PROXY_LIST = [
     p.strip()
     for p in os.getenv("PROXY_LIST", "").replace(";", ",").replace("\n", ",").split(",")
@@ -232,6 +236,41 @@ def decode_bing_url(href: str) -> str:
         return ""
 
     return href
+
+TRANSPORT_KEYWORDS = [
+    "火車",
+    "高鐵",
+    "台鐵",
+    "列車",
+    "時刻表",
+    "班次",
+    "車次",
+    "票",
+    "時刻",
+    "時間",
+]
+
+
+def is_transport_query(query: str) -> bool:
+    lower_query = query.lower()
+    return any(keyword in lower_query for keyword in TRANSPORT_KEYWORDS)
+
+
+def build_search_variants(query: str, max_variations: int = 3) -> list[str]:
+    variants = [query.strip()]
+    if not variants[0]:
+        return variants
+
+    if is_transport_query(query) or re.search(r"明天|後天|今天|上午|下午|晚上|\d{1,2}點|\d{1,2}:\d{2}", query):
+        suffixes = ["時刻表", "班次", "查詢"]
+        for suffix in suffixes:
+            if len(variants) >= max_variations:
+                break
+            if suffix not in query:
+                candidate = f"{variants[0]} {suffix}"
+                if candidate not in variants:
+                    variants.append(candidate)
+    return variants[:max_variations]
 
 
 def _is_cache_valid(entry: tuple[float, object]) -> bool:
@@ -428,6 +467,7 @@ async def infer_subqueries(query: str, subquery_count: int = 3) -> list[str]:
         "你是一個專門把使用者查詢拆成搜尋子查詢的助手。\n"
         "請判斷下面的查詢是否包含多個問題，並回傳最多 "
         f"{subquery_count} 個適合直接送到搜尋引擎的子查詢。\n"
+        "這些子查詢應該盡量讓搜尋結果精準找到具體時間、班次、價格、規格或其他數據。\n"
         "回傳格式請只使用 JSON 陣列，例如 [\"子查詢一\", \"子查詢二\"]。\n"
         "如果這個查詢只有一個問題，請回傳原始查詢本身。不要生成答案，不要附加說明。\n\n"
         f"使用者查詢：{query}"
@@ -463,10 +503,26 @@ async def infer_subqueries(query: str, subquery_count: int = 3) -> list[str]:
 
 
 async def search_single_query(query: str, max_results: int = 5) -> list[dict]:
-    links = await get_bing_links(query, candidate_count=max_results * 3)
+    variants = build_search_variants(query, max_variations=3)
+    logger.info(f"🔎 搜尋變體：{variants}")
+
+    seen_links = set()
+    links: list[str] = []
+    for variant in variants:
+        if len(links) >= max_results * 3:
+            break
+        variant_links = await get_bing_links(variant, candidate_count=max_results * 2)
+        for link in variant_links:
+            if link not in seen_links:
+                seen_links.add(link)
+                links.append(link)
+        if len(links) >= max_results * 3:
+            break
+
     if not links:
         logger.warning("沒有抓到任何連結")
         return []
+
     tasks = [fetch_page(url) for url in links]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     contents: list[dict] = []
